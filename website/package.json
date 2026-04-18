@@ -1,0 +1,12 @@
+{
+  "name": "starry-website",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000"
+  },
+  "dependencies": {
+    "next": "14",
+    "react": "18",
+    "react-dom": "18"
+  }
+}
