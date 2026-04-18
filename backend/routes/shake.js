@@ -1,33 +1,127 @@
 const router = require("express").Router()
+const Redis = require("ioredis")
 const { addMoney } = require("../services/walletService")
 
-let pool = []
+const redis = new Redis(process.env.REDIS_URL)
 
+// CONFIG
+const REWARD = 0.05
+const MATCH_WINDOW = 10 // seconds
+const COOLDOWN = 10 // seconds
+const DISTANCE_LIMIT_KM = 0.5 // 500 meters
+
+// --------------------
+// Haversine formula (real GPS distance)
+// --------------------
+function getDistanceKm(lat1, lon1, lat2, lon2) {
+  const R = 6371
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLon = (lon2 - lon1) * Math.PI / 180
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) *
+    Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) ** 2
+
+  return 2 * R * Math.asin(Math.sqrt(a))
+}
+
+// --------------------
+// Main route
+// --------------------
 router.post("/", async (req, res) => {
-  const { userId, lat, lng } = req.body
+  try {
+    const { userId, lat, lng } = req.body
 
-  const now = Date.now()
+    if (!userId || lat == null || lng == null) {
+      return res.status(400).json({ success: false, message: "Invalid request" })
+    }
 
-  // remove old entries (10 seconds window)
-  pool = pool.filter(u => now - u.time < 10000)
+    const now = Date.now()
 
-  // find nearby users
-  const match = pool.find(u =>
-    Math.abs(u.lat - lat) < 0.005 &&
-    Math.abs(u.lng - lng) < 0.005 &&
-    u.userId !== userId
-  )
+    // --------------------
+    // 1. Cooldown check (anti-spam)
+    // --------------------
+    const cooldownKey = `shake:cooldown:${userId}`
+    const last = await redis.get(cooldownKey)
 
-  if (match) {
-    await addMoney(userId, 0.05)
-    await addMoney(match.userId, 0.05)
+    if (last && now - parseInt(last) < COOLDOWN * 1000) {
+      return res.json({ success: false, message: "Cooldown active" })
+    }
 
-    return res.json({ success: true, reward: 0.05 })
+    await redis.set(cooldownKey, now, "EX", COOLDOWN)
+
+    // --------------------
+    // 2. Try to find match
+    // --------------------
+    const poolKey = "shake:pool"
+    const poolRaw = await redis.lrange(poolKey, 0, -1)
+
+    let match = null
+    let matchIndex = -1
+
+    for (let i = 0; i < poolRaw.length; i++) {
+      const u = JSON.parse(poolRaw[i])
+
+      if (u.userId === userId) continue
+
+      const distance = getDistanceKm(lat, lng, u.lat, u.lng)
+
+      if (distance <= DISTANCE_LIMIT_KM) {
+        match = u
+        matchIndex = i
+        break
+      }
+    }
+
+    // --------------------
+    // 3. If match found → atomic reward + cleanup
+    // --------------------
+    if (match) {
+      // remove matched user from pool
+      await redis.lrem(poolKey, 1, JSON.stringify(match))
+
+      // reward both users
+      await Promise.all([
+        addMoney(userId, REWARD),
+        addMoney(match.userId, REWARD)
+      ])
+
+      return res.json({
+        success: true,
+        reward: REWARD,
+        matched: true
+      })
+    }
+
+    // --------------------
+    // 4. No match → add to pool
+    // --------------------
+    const userEntry = JSON.stringify({
+      userId,
+      lat,
+      lng,
+      time: now
+    })
+
+    await redis.rpush(poolKey, userEntry)
+
+    // auto-expire pool entries after window
+    await redis.expire(poolKey, MATCH_WINDOW)
+
+    return res.json({
+      success: false,
+      message: "Searching for nearby users"
+    })
+
+  } catch (err) {
+    console.error("Shake error:", err)
+    return res.status(500).json({
+      success: false,
+      message: "Server error"
+    })
   }
-
-  pool.push({ userId, lat, lng, time: now })
-
-  res.json({ success: false })
 })
 
 module.exports = router
